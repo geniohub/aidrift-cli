@@ -75,6 +75,11 @@ interface SessionDto {
   endedAt: string | null;
   taskKeywords: string[];
 }
+interface ScoreDto {
+  score: number;
+  trend: "improving" | "stable" | "drifting";
+  reasons: Array<{ code: string; delta: number; message: string }>;
+}
 interface TurnDto {
   id: string;
   turnIndex: number;
@@ -116,9 +121,21 @@ session
     }
   });
 
+function colorScore(score: number): string {
+  if (score >= 80) return chalk.green(String(score).padStart(3, " "));
+  if (score >= 65) return chalk.yellow(String(score).padStart(3, " "));
+  return chalk.red(String(score).padStart(3, " "));
+}
+
+function trendArrow(trend: ScoreDto["trend"]): string {
+  if (trend === "improving") return chalk.green("↗");
+  if (trend === "drifting") return chalk.red("↘");
+  return chalk.gray("→");
+}
+
 session
   .command("list")
-  .description("List recent drift sessions")
+  .description("List recent drift sessions with scores")
   .action(async () => {
     requireAuth();
     try {
@@ -127,9 +144,17 @@ session
         console.log(chalk.gray("no sessions yet — run `drift session start`"));
         return;
       }
-      for (const s of list) {
+      const scores = await Promise.all(
+        list.map((s) => api<ScoreDto | null>(`/sessions/${s.id}/score`).catch(() => null)),
+      );
+      for (let i = 0; i < list.length; i++) {
+        const s = list[i]!;
+        const score = scores[i];
         const badge = s.endedAt ? chalk.gray("ended ") : chalk.green("open  ");
-        console.log(`${badge}${chalk.bold(s.id.slice(-8))}  ${s.provider}  ${chalk.dim(s.taskDescription.slice(0, 60))}`);
+        const scoreStr = score ? `${colorScore(score.score)} ${trendArrow(score.trend)}` : chalk.gray(" — ·");
+        console.log(
+          `${badge}${chalk.bold(s.id.slice(-8))}  ${scoreStr}  ${s.provider.padEnd(12)}  ${chalk.dim(s.taskDescription.slice(0, 60))}`,
+        );
       }
     } catch (err) {
       console.error(chalk.red(`✘ ${(err as Error).message}`));
