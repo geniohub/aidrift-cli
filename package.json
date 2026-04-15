@@ -1,0 +1,26 @@
+{
+  "name": "@aidrift/cli",
+  "version": "0.0.1",
+  "private": true,
+  "description": "drift CLI for AI Drift Detector",
+  "type": "module",
+  "bin": {
+    "drift": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@aidrift/core": "workspace:*",
+    "commander": "^12.1.0",
+    "chalk": "^5.3.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.4"
+  }
+}
