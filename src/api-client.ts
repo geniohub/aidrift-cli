@@ -3,7 +3,10 @@
 
 import { load, save, clear, type StoredAuth } from "./auth/store.js";
 
-export const DEFAULT_API_URL = process.env.AIDRIFT_API_URL ?? "http://localhost:3330";
+// Single public origin for all clients. In local dev this is the frontend
+// container at :3331 which proxies /api/* to the api container. In SaaS
+// deployment, override with AIDRIFT_API_URL=https://aidrift.example.com/api.
+export const DEFAULT_API_URL = process.env.AIDRIFT_API_URL ?? "http://localhost:3331/api";
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
