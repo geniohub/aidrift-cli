@@ -12,8 +12,10 @@ const FILE = join(DIR, "auth.json");
 export interface StoredAuth {
   apiBaseUrl: string;
   email: string;
-  accessToken: string;
-  refreshToken: string;
+  // Exactly one of { accessToken + refreshToken } or { pat } is populated.
+  accessToken?: string;
+  refreshToken?: string;
+  pat?: string;
 }
 
 export function load(): StoredAuth | null {

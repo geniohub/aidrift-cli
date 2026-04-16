@@ -30,6 +30,11 @@ async function rawFetch(path: string, init: FetchInit): Promise<Response> {
   return fetch(url, { ...init, headers });
 }
 
+function bearerFromStore(stored: StoredAuth | null): string | null {
+  if (!stored) return null;
+  return stored.pat ?? stored.accessToken ?? null;
+}
+
 interface AuthResponse {
   accessToken: string;
   refreshToken: string;
@@ -64,16 +69,17 @@ export async function api<T = unknown>(
   let res = await rawFetch(path, {
     ...init,
     apiBaseUrl,
-    accessToken: stored?.accessToken ?? null,
+    accessToken: bearerFromStore(stored),
   });
-  if (res.status === 401 && stored && !init.skipAuth) {
+  // PATs don't refresh. Only retry on 401 if we're using a JWT pair.
+  if (res.status === 401 && stored && !init.skipAuth && stored.accessToken && !stored.pat) {
     const refreshed = await tryRefresh(stored);
     if (refreshed) {
       stored = refreshed;
       res = await rawFetch(path, {
         ...init,
         apiBaseUrl,
-        accessToken: refreshed.accessToken,
+        accessToken: bearerFromStore(refreshed),
       });
     }
   }
@@ -110,6 +116,29 @@ export async function loginAndPersist(
     email: data.user.email,
     accessToken: data.accessToken,
     refreshToken: data.refreshToken,
+  };
+  save(stored);
+  return stored;
+}
+
+export async function loginWithTokenAndPersist(
+  apiBaseUrl: string,
+  token: string,
+): Promise<StoredAuth> {
+  // Probe /auth/me with the token to confirm it's valid and learn the email.
+  const res = await rawFetch("/auth/me", {
+    apiBaseUrl,
+    accessToken: token,
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new ApiError(res.status, body.error ?? res.statusText);
+  }
+  const user = (await res.json()) as { id: string; email: string };
+  const stored: StoredAuth = {
+    apiBaseUrl,
+    email: user.email,
+    pat: token,
   };
   save(stored);
   return stored;

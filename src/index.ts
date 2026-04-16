@@ -2,8 +2,11 @@
 import { Command } from "commander";
 import chalk from "chalk";
 import { input, password as passwordPrompt } from "@inquirer/prompts";
+import { readFile } from "node:fs/promises";
+import { spawn, spawnSync } from "node:child_process";
+import { basename, resolve } from "node:path";
 import { VERSION } from "@aidrift/core";
-import { api, ApiError, DEFAULT_API_URL, loginAndPersist, logoutAndClear } from "./api-client.js";
+import { api, ApiError, DEFAULT_API_URL, loginAndPersist, loginWithTokenAndPersist, logoutAndClear } from "./api-client.js";
 import { load } from "./auth/store.js";
 
 const program = new Command();
@@ -18,11 +21,19 @@ program
 program
   .command("login")
   .description("Sign in to the local AI Drift backend")
+  .option("--token <token>", "Personal Access Token from the dashboard (required for Google users)")
   .option("--email <email>")
   .option("--password <password>", "(insecure: visible in shell history)")
   .option("--api <url>", "API base URL", DEFAULT_API_URL)
-  .action(async (opts: { email?: string; password?: string; api: string }) => {
+  .action(async (opts: { token?: string; email?: string; password?: string; api: string }) => {
     try {
+      if (opts.token || (!opts.email && !opts.password)) {
+        // Token flow: prompt for token unless already supplied.
+        const token = opts.token ?? (await passwordPrompt({ message: "Token:", mask: "*" }));
+        const stored = await loginWithTokenAndPersist(opts.api, token.trim());
+        console.log(chalk.green(`✔ signed in as ${stored.email} (token)`));
+        return;
+      }
       const email = opts.email ?? (await input({ message: "Email:" }));
       const pw = opts.password ?? (await passwordPrompt({ message: "Password:", mask: "*" }));
       const stored = await loginAndPersist(opts.api, email, pw);
@@ -71,6 +82,7 @@ interface SessionDto {
   taskDescription: string;
   provider: string;
   model: string | null;
+  workspacePath?: string | null;
   startedAt: string;
   endedAt: string | null;
   taskKeywords: string[];
@@ -87,12 +99,98 @@ interface TurnDto {
   userPrompt: string;
   modelResponse: string;
 }
+type ExecutionStage = "lint" | "build" | "test" | "runtime";
+type ExecutionStatus = "pass" | "fail";
 
 function requireAuth(): void {
   if (!load()) {
     console.error(chalk.yellow("not signed in — run `drift login`"));
     process.exit(1);
   }
+}
+
+function runGit(args: string[]): string | undefined {
+  const r = spawnSync("git", args, { encoding: "utf8" });
+  if (r.status !== 0) return undefined;
+  const out = (r.stdout ?? "").trim();
+  return out || undefined;
+}
+
+function currentWorkspacePath(): string {
+  return runGit(["rev-parse", "--show-toplevel"]) ?? resolve(process.cwd());
+}
+
+function currentBranch(): string | undefined {
+  return runGit(["rev-parse", "--abbrev-ref", "HEAD"]);
+}
+
+function defaultTaskDescription(workspacePath: string): string {
+  const repo = basename(workspacePath);
+  const branch = currentBranch();
+  return branch ? `repo:${repo} branch:${branch}` : `repo:${repo}`;
+}
+
+async function ensureSession(input: {
+  provider: string;
+  taskDescription?: string;
+  model?: string;
+  workspacePath?: string;
+}): Promise<SessionDto> {
+  requireAuth();
+  const workspacePath = input.workspacePath ?? currentWorkspacePath();
+  const taskDescription = input.taskDescription ?? defaultTaskDescription(workspacePath);
+  const list = await api<SessionDto[]>(`/sessions?limit=200&workspacePath=${encodeURIComponent(workspacePath)}`);
+  const open = list.find((s) => !s.endedAt && s.provider === input.provider);
+  if (open) return open;
+  return api<SessionDto>("/sessions", {
+    method: "POST",
+    body: JSON.stringify({
+      taskDescription,
+      provider: input.provider,
+      model: input.model,
+      workspacePath,
+    }),
+  });
+}
+
+async function resolveTurnIdForExecution(input: {
+  turn?: string;
+  session?: string;
+  autoSession?: boolean;
+  provider?: string;
+  model?: string;
+  task?: string;
+  stage: ExecutionStage;
+}): Promise<string> {
+  if (input.turn) return input.turn;
+
+  let sessionId = input.session;
+  if (!sessionId && input.autoSession) {
+    const s = await ensureSession({
+      provider: input.provider ?? "codex",
+      model: input.model,
+      taskDescription: input.task,
+    });
+    sessionId = s.id;
+  }
+  if (!sessionId) {
+    throw new Error("provide --turn, or --session, or use --auto-session");
+  }
+  const turns = await api<TurnDto[]>(`/sessions/${sessionId}/turns`);
+  const last = turns.at(-1);
+  if (last) return last.id;
+
+  const created = await api<TurnDto>(`/sessions/${sessionId}/turns`, {
+    method: "POST",
+    body: JSON.stringify({
+      userPrompt: `[exec:${input.stage}] auto telemetry turn`,
+      modelResponse: "execution telemetry placeholder",
+      metadata: {
+        source: "drift-cli-auto-exec",
+      },
+    }),
+  });
+  return created.id;
 }
 
 const session = program.command("session").description("Manage drift sessions");
@@ -102,7 +200,8 @@ session
   .requiredOption("--task <text>", "Task description")
   .requiredOption("--provider <name>", "Provider: claude-code | codex")
   .option("--model <name>")
-  .action(async (opts: { task: string; provider: string; model?: string }) => {
+  .option("--workspace <path>", "Workspace path (defaults to current repo root)")
+  .action(async (opts: { task: string; provider: string; model?: string; workspace?: string }) => {
     requireAuth();
     try {
       const s = await api<SessionDto>("/sessions", {
@@ -111,10 +210,42 @@ session
           taskDescription: opts.task,
           provider: opts.provider,
           model: opts.model,
+          workspacePath: opts.workspace ?? currentWorkspacePath(),
         }),
       });
       console.log(chalk.green(`✔ session ${s.id}`));
       console.log(chalk.gray(`  keywords: ${s.taskKeywords.join(", ")}`));
+    } catch (err) {
+      console.error(chalk.red(`✘ ${(err as Error).message}`));
+      process.exit(1);
+    }
+  });
+
+session
+  .command("ensure")
+  .description("Find or create an open session for the current repo/workspace")
+  .option("--provider <name>", "Provider: claude-code | codex", "codex")
+  .option("--task <text>", "Task description (defaults to repo+branch)")
+  .option("--model <name>")
+  .option("--workspace <path>", "Workspace path (defaults to current repo root)")
+  .option("--json", "Print JSON output")
+  .action(async (opts: { provider: string; task?: string; model?: string; workspace?: string; json?: boolean }) => {
+    requireAuth();
+    try {
+      const s = await ensureSession({
+        provider: opts.provider,
+        taskDescription: opts.task,
+        model: opts.model,
+        workspacePath: opts.workspace ?? currentWorkspacePath(),
+      });
+      if (opts.json) {
+        console.log(JSON.stringify(s, null, 2));
+      } else {
+        console.log(chalk.green(`✔ session ${s.id}`));
+        console.log(chalk.gray(`  provider: ${s.provider}`));
+        console.log(chalk.gray(`  workspace: ${s.workspacePath ?? "n/a"}`));
+        console.log(chalk.gray(`  task: ${s.taskDescription}`));
+      }
     } catch (err) {
       console.error(chalk.red(`✘ ${(err as Error).message}`));
       process.exit(1);
@@ -204,6 +335,23 @@ async function setOutcome(turnId: string, outcome: "accepted" | "rejected", note
   }
 }
 
+async function recordExecution(
+  turnId: string,
+  payload: {
+    stage: ExecutionStage;
+    status: ExecutionStatus;
+    durationMs?: number;
+    errorType?: string;
+    errorMessage?: string;
+    happenedAt?: string;
+  },
+): Promise<void> {
+  await api<TurnDto>(`/turns/${turnId}/execution`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
 turn
   .command("accept")
   .description("Mark a turn as accepted")
@@ -238,12 +386,293 @@ turn
     }
   });
 
+turn
+  .command("exec")
+  .description("Record lint/build/test/runtime result for a turn")
+  .option("--turn <id>")
+  .option("--session <id>")
+  .option("--auto-session", "Auto-find/create session for current repo")
+  .option("--provider <name>", "Used with --auto-session", "codex")
+  .option("--task <text>", "Used with --auto-session")
+  .option("--model <name>", "Used with --auto-session")
+  .requiredOption("--stage <stage>", "lint | build | test | runtime")
+  .requiredOption("--status <status>", "pass | fail")
+  .option("--duration <ms>")
+  .option("--error-type <type>")
+  .option("--error <message>")
+  .option("--at <iso>", "ISO timestamp")
+  .action(async (opts: {
+    turn?: string;
+    session?: string;
+    autoSession?: boolean;
+    provider?: string;
+    task?: string;
+    model?: string;
+    stage: ExecutionStage;
+    status: ExecutionStatus;
+    duration?: string;
+    errorType?: string;
+    error?: string;
+    at?: string;
+  }) => {
+    requireAuth();
+    try {
+      const turnId = await resolveTurnIdForExecution({
+        turn: opts.turn,
+        session: opts.session,
+        autoSession: opts.autoSession,
+        provider: opts.provider,
+        model: opts.model,
+        task: opts.task,
+        stage: opts.stage,
+      });
+      await recordExecution(turnId, {
+        stage: opts.stage,
+        status: opts.status,
+        durationMs: opts.duration ? Number(opts.duration) : undefined,
+        errorType: opts.errorType,
+        errorMessage: opts.error,
+        happenedAt: opts.at,
+      });
+      console.log(chalk.green(`✔ recorded ${opts.stage}=${opts.status} for turn ${turnId.slice(-8)}`));
+    } catch (err) {
+      console.error(chalk.red(`✘ ${(err as Error).message}`));
+      process.exit(1);
+    }
+  });
+
+turn
+  .command("exec-run")
+  .description("Run a command and auto-record pass/fail for a turn")
+  .option("--turn <id>")
+  .option("--session <id>")
+  .option("--auto-session", "Auto-find/create session for current repo")
+  .option("--provider <name>", "Used with --auto-session", "codex")
+  .option("--task <text>", "Used with --auto-session")
+  .option("--model <name>", "Used with --auto-session")
+  .requiredOption("--stage <stage>", "lint | build | test | runtime")
+  .argument("<cmd...>", "Command and args")
+  .action(async (
+    opts: {
+      turn?: string;
+      session?: string;
+      autoSession?: boolean;
+      provider?: string;
+      task?: string;
+      model?: string;
+      stage: ExecutionStage;
+    },
+    cmd: string[],
+  ) => {
+    requireAuth();
+    if (!cmd || cmd.length === 0) {
+      console.error(chalk.red("✘ command is required"));
+      process.exit(1);
+    }
+    const started = Date.now();
+    const proc = spawn(cmd[0]!, cmd.slice(1), {
+      stdio: ["inherit", "pipe", "pipe"],
+      env: process.env,
+    });
+    let out = "";
+    let err = "";
+    proc.stdout.on("data", (d) => {
+      const s = d.toString();
+      out += s;
+      process.stdout.write(s);
+    });
+    proc.stderr.on("data", (d) => {
+      const s = d.toString();
+      err += s;
+      process.stderr.write(s);
+    });
+    const code = await new Promise<number>((resolve) => {
+      proc.on("close", (c) => resolve(c ?? 1));
+    });
+
+    const durationMs = Date.now() - started;
+    const status: ExecutionStatus = code === 0 ? "pass" : "fail";
+    const msg = (err || out).trim().slice(-8000);
+    try {
+      const turnId = await resolveTurnIdForExecution({
+        turn: opts.turn,
+        session: opts.session,
+        autoSession: opts.autoSession,
+        provider: opts.provider,
+        model: opts.model,
+        task: opts.task,
+        stage: opts.stage,
+      });
+      await recordExecution(turnId, {
+        stage: opts.stage,
+        status,
+        durationMs,
+        errorType: status === "fail" ? "command_exit_nonzero" : undefined,
+        errorMessage: status === "fail" && msg ? msg : undefined,
+      });
+      const mark = status === "pass" ? chalk.green("✔") : chalk.red("✘");
+      console.log(`${mark} recorded ${opts.stage}=${status} for turn ${turnId.slice(-8)} (${durationMs}ms)`);
+    } catch (e) {
+      console.error(chalk.red(`✘ failed to record execution: ${(e as Error).message}`));
+    }
+    if (code !== 0) process.exit(code);
+  });
+
+function parseLogOutcome(framework: string, text: string): { status: ExecutionStatus; errorType?: string; errorMessage?: string } {
+  const f = framework.toLowerCase();
+  if (f === "vitest") {
+    const pass = /Test Files\s+\d+\s+passed/i.test(text) || /\bTest Files\b[\s\S]*\b0 failed\b/i.test(text);
+    return pass
+      ? { status: "pass" }
+      : { status: "fail", errorType: "vitest_failure", errorMessage: text.trim().slice(-8000) };
+  }
+  if (f === "jest") {
+    const pass = /\bTests:\s+.*0 failed/i.test(text) || /\bPASS\b/m.test(text);
+    return pass
+      ? { status: "pass" }
+      : { status: "fail", errorType: "jest_failure", errorMessage: text.trim().slice(-8000) };
+  }
+  if (f === "pytest") {
+    const pass = /=+[\s\S]*\b\d+\s+passed\b/i.test(text) && !/\bfailed\b/i.test(text);
+    return pass
+      ? { status: "pass" }
+      : { status: "fail", errorType: "pytest_failure", errorMessage: text.trim().slice(-8000) };
+  }
+  if (f === "go") {
+    const pass = /^ok\s/m.test(text) && !/^FAIL/m.test(text);
+    return pass
+      ? { status: "pass" }
+      : { status: "fail", errorType: "go_test_failure", errorMessage: text.trim().slice(-8000) };
+  }
+  const genericPass = /\b(pass|passed|success)\b/i.test(text) && !/\b(fail|failed|error)\b/i.test(text);
+  return genericPass
+    ? { status: "pass" }
+    : { status: "fail", errorType: "log_failure", errorMessage: text.trim().slice(-8000) };
+}
+
+turn
+  .command("exec-log")
+  .description("Parse a test/lint/build log file and record pass/fail")
+  .option("--turn <id>")
+  .option("--session <id>")
+  .option("--auto-session", "Auto-find/create session for current repo")
+  .option("--provider <name>", "Used with --auto-session", "codex")
+  .option("--task <text>", "Used with --auto-session")
+  .option("--model <name>", "Used with --auto-session")
+  .requiredOption("--stage <stage>", "lint | build | test | runtime")
+  .requiredOption("--framework <name>", "vitest | jest | pytest | go | generic")
+  .requiredOption("--file <path>")
+  .action(async (opts: {
+    turn?: string;
+    session?: string;
+    autoSession?: boolean;
+    provider?: string;
+    task?: string;
+    model?: string;
+    stage: ExecutionStage;
+    framework: string;
+    file: string;
+  }) => {
+    requireAuth();
+    try {
+      const text = await readFile(opts.file, "utf8");
+      const result = parseLogOutcome(opts.framework, text);
+      const turnId = await resolveTurnIdForExecution({
+        turn: opts.turn,
+        session: opts.session,
+        autoSession: opts.autoSession,
+        provider: opts.provider,
+        model: opts.model,
+        task: opts.task,
+        stage: opts.stage,
+      });
+      await recordExecution(turnId, {
+        stage: opts.stage,
+        status: result.status,
+        errorType: result.errorType,
+        errorMessage: result.errorMessage,
+      });
+      console.log(chalk.green(`✔ recorded ${opts.stage}=${result.status} from ${opts.framework} log for ${turnId.slice(-8)}`));
+    } catch (err) {
+      console.error(chalk.red(`✘ ${(err as Error).message}`));
+      process.exit(1);
+    }
+  });
+
+function parseJunit(xml: string): { status: ExecutionStatus; errorType?: string; errorMessage?: string } {
+  const failures = [...xml.matchAll(/failures="(\d+)"/g)].reduce((a, m) => a + Number(m[1] ?? 0), 0);
+  const errors = [...xml.matchAll(/errors="(\d+)"/g)].reduce((a, m) => a + Number(m[1] ?? 0), 0);
+  if (failures + errors === 0) return { status: "pass" };
+  const firstFailure =
+    /<(failure|error)\b[^>]*message="([^"]*)"/i.exec(xml)?.[2] ??
+    /<(failure|error)\b[^>]*>([\s\S]*?)<\/(failure|error)>/i.exec(xml)?.[2] ??
+    "junit reported failures";
+  return {
+    status: "fail",
+    errorType: errors > 0 ? "junit_error" : "junit_failure",
+    errorMessage: firstFailure.trim().slice(0, 8000),
+  };
+}
+
+turn
+  .command("exec-junit")
+  .description("Parse JUnit XML and record test pass/fail")
+  .option("--turn <id>")
+  .option("--session <id>")
+  .option("--auto-session", "Auto-find/create session for current repo")
+  .option("--provider <name>", "Used with --auto-session", "codex")
+  .option("--task <text>", "Used with --auto-session")
+  .option("--model <name>", "Used with --auto-session")
+  .requiredOption("--file <path>")
+  .option("--stage <stage>", "defaults to test", "test")
+  .action(async (opts: {
+    turn?: string;
+    session?: string;
+    autoSession?: boolean;
+    provider?: string;
+    task?: string;
+    model?: string;
+    file: string;
+    stage: ExecutionStage;
+  }) => {
+    requireAuth();
+    try {
+      const xml = await readFile(opts.file, "utf8");
+      const parsed = parseJunit(xml);
+      const turnId = await resolveTurnIdForExecution({
+        turn: opts.turn,
+        session: opts.session,
+        autoSession: opts.autoSession,
+        provider: opts.provider,
+        model: opts.model,
+        task: opts.task,
+        stage: opts.stage,
+      });
+      await recordExecution(turnId, {
+        stage: opts.stage,
+        status: parsed.status,
+        errorType: parsed.errorType,
+        errorMessage: parsed.errorMessage,
+      });
+      console.log(chalk.green(`✔ recorded ${opts.stage}=${parsed.status} from junit for ${turnId.slice(-8)}`));
+    } catch (err) {
+      console.error(chalk.red(`✘ ${(err as Error).message}`));
+      process.exit(1);
+    }
+  });
+
 interface StatusDto {
   session: { id: string; taskDescription: string; provider: string };
   currentScore: number | null;
   trend: "improving" | "stable" | "drifting";
   turnCount: number;
-  alert: { active: boolean; reasons: string[]; likelyDriftStartTurnId: string | null };
+  alert: {
+    active: boolean;
+    reasons: string[];
+    likelyDriftStartTurnId: string | null;
+    type: "none" | "infra" | "stuck_loop" | "rejection_cascade" | "misalignment" | "gradual_decay";
+    recommendation: string | null;
+  };
   lastStableCheckpoint: { id: string; summary: string; scoreAtCheckpoint: number; createdAt: string } | null;
 }
 interface CheckpointDto {
@@ -276,10 +705,13 @@ program
       console.log(`  provider: ${s.session.provider}   turns: ${s.turnCount}`);
       console.log(`  score:    ${scoreStr} ${trendArrow(s.trend)}  (${s.trend})`);
       if (s.alert.active) {
-        console.log(chalk.red("  ⚠ drift detected"));
+        console.log(chalk.red(`  ⚠ drift detected [${s.alert.type}]`));
         for (const r of s.alert.reasons) console.log(chalk.red(`    · ${r}`));
         if (s.alert.likelyDriftStartTurnId) {
           console.log(chalk.red(`    likely drift start: turn ${s.alert.likelyDriftStartTurnId.slice(-8)}`));
+        }
+        if (s.alert.recommendation) {
+          console.log(chalk.yellow(`    → ${s.alert.recommendation}`));
         }
       } else {
         console.log(chalk.green("  ✓ no drift alert"));
