@@ -1,13 +1,20 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("../src/auth/store.js", () => ({
-  load: vi.fn(),
-  save: vi.fn(),
-  clear: vi.fn(),
+vi.mock("../src/auth/profiles.js", () => ({
+  DEFAULT_API_URL: "http://localhost:3331/api",
+  loadActiveProfile: vi.fn(),
+  saveActiveProfile: vi.fn(),
+  clearActiveProfile: vi.fn(),
+  updateProfile: vi.fn(),
 }));
 
 import { api, ApiError, loginWithTokenAndPersist, logoutAndClear } from "../src/api-client.js";
-import { clear, load, save } from "../src/auth/store.js";
+import {
+  clearActiveProfile,
+  loadActiveProfile,
+  saveActiveProfile,
+  updateProfile,
+} from "../src/auth/profiles.js";
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -19,17 +26,21 @@ function jsonResponse(body: unknown, status = 200): Response {
 describe("cli api client", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
-    vi.mocked(load).mockReset();
-    vi.mocked(save).mockReset();
-    vi.mocked(clear).mockReset();
+    vi.mocked(loadActiveProfile).mockReset();
+    vi.mocked(saveActiveProfile).mockReset();
+    vi.mocked(clearActiveProfile).mockReset();
+    vi.mocked(updateProfile).mockReset();
     vi.stubGlobal("fetch", vi.fn());
   });
 
-  it("uses PAT from stored auth for authenticated requests", async () => {
-    vi.mocked(load).mockReturnValue({
-      apiBaseUrl: "http://localhost:3331/api",
-      email: "u@example.com",
-      pat: "aidrift_pat_abc",
+  it("uses PAT from active profile for authenticated requests", async () => {
+    vi.mocked(loadActiveProfile).mockReturnValue({
+      name: "default",
+      profile: {
+        apiBaseUrl: "http://localhost:3331/api",
+        email: "u@example.com",
+        pat: "aidrift_pat_abc",
+      },
     });
     vi.mocked(fetch).mockResolvedValueOnce(jsonResponse({ ok: true }));
 
@@ -44,11 +55,14 @@ describe("cli api client", () => {
   });
 
   it("refreshes JWT on 401 and retries original request", async () => {
-    vi.mocked(load).mockReturnValue({
-      apiBaseUrl: "http://localhost:3331/api",
-      email: "u@example.com",
-      accessToken: "old-access",
-      refreshToken: "old-refresh",
+    vi.mocked(loadActiveProfile).mockReturnValue({
+      name: "default",
+      profile: {
+        apiBaseUrl: "http://localhost:3331/api",
+        email: "u@example.com",
+        accessToken: "old-access",
+        refreshToken: "old-refresh",
+      },
     });
 
     vi.mocked(fetch)
@@ -66,7 +80,7 @@ describe("cli api client", () => {
 
     expect(out.ok).toBe(true);
     expect(fetch).toHaveBeenCalledTimes(3);
-    expect(save).toHaveBeenCalledWith({
+    expect(updateProfile).toHaveBeenCalledWith("default", {
       apiBaseUrl: "http://localhost:3331/api",
       email: "u@example.com",
       accessToken: "new-access",
@@ -75,7 +89,10 @@ describe("cli api client", () => {
   });
 
   it("throws ApiError with parsed backend error message", async () => {
-    vi.mocked(load).mockReturnValue(null);
+    vi.mocked(loadActiveProfile).mockReturnValue({
+      name: "default",
+      profile: { apiBaseUrl: "http://localhost:3331/api" },
+    });
     vi.mocked(fetch).mockResolvedValueOnce(jsonResponse({ error: "forbidden" }, 403));
 
     try {
@@ -100,11 +117,11 @@ describe("cli api client", () => {
       email: "u@example.com",
       pat: "aidrift_pat_testtoken",
     });
-    expect(save).toHaveBeenCalledWith(stored);
+    expect(saveActiveProfile).toHaveBeenCalledWith(stored);
   });
 
-  it("clears stored auth on logout", () => {
+  it("clears active profile credentials on logout", () => {
     logoutAndClear();
-    expect(clear).toHaveBeenCalledTimes(1);
+    expect(clearActiveProfile).toHaveBeenCalledTimes(1);
   });
 });

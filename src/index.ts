@@ -7,7 +7,14 @@ import { spawn, spawnSync } from "node:child_process";
 import { basename, resolve } from "node:path";
 import { VERSION } from "@aidrift/core";
 import { api, ApiError, DEFAULT_API_URL, loginAndPersist, loginWithTokenAndPersist, logoutAndClear } from "./api-client.js";
-import { load } from "./auth/store.js";
+import {
+  addProfile,
+  listProfiles,
+  loadActiveProfile,
+  removeProfile,
+  updateProfile,
+  useProfile,
+} from "./auth/profiles.js";
 
 const program = new Command();
 
@@ -20,24 +27,45 @@ program
 
 program
   .command("login")
-  .description("Sign in to the local AI Drift backend")
+  .description("Sign in to AI Drift (uses the active profile unless --profile is given)")
   .option("--token <token>", "Personal Access Token from the dashboard (required for Google users)")
   .option("--email <email>")
   .option("--password <password>", "(insecure: visible in shell history)")
-  .option("--api <url>", "API base URL", DEFAULT_API_URL)
-  .action(async (opts: { token?: string; email?: string; password?: string; api: string }) => {
+  .option("--api <url>", "Override the profile's API base URL for this login")
+  .option("--profile <name>", "Log into this profile instead of the active one (switches active)")
+  .action(async (opts: {
+    token?: string;
+    email?: string;
+    password?: string;
+    api?: string;
+    profile?: string;
+  }) => {
     try {
+      if (opts.profile) {
+        const all = listProfiles();
+        if (!all.profiles[opts.profile]) {
+          const url = opts.api ?? DEFAULT_API_URL;
+          addProfile(opts.profile, url);
+          console.log(chalk.gray(`  created profile "${opts.profile}" at ${url}`));
+        }
+        useProfile(opts.profile);
+      }
+      const { name, profile } = loadActiveProfile();
+      const apiBaseUrl = opts.api ?? profile.apiBaseUrl ?? DEFAULT_API_URL;
+      // Persist the chosen URL on the profile so future requests use it.
+      if (apiBaseUrl !== profile.apiBaseUrl) {
+        updateProfile(name, { apiBaseUrl });
+      }
       if (opts.token || (!opts.email && !opts.password)) {
-        // Token flow: prompt for token unless already supplied.
         const token = opts.token ?? (await passwordPrompt({ message: "Token:", mask: "*" }));
-        const stored = await loginWithTokenAndPersist(opts.api, token.trim());
-        console.log(chalk.green(`✔ signed in as ${stored.email} (token)`));
+        const stored = await loginWithTokenAndPersist(apiBaseUrl, token.trim());
+        console.log(chalk.green(`✔ signed in as ${stored.email} (token) [profile: ${name}]`));
         return;
       }
       const email = opts.email ?? (await input({ message: "Email:" }));
       const pw = opts.password ?? (await passwordPrompt({ message: "Password:", mask: "*" }));
-      const stored = await loginAndPersist(opts.api, email, pw);
-      console.log(chalk.green(`✔ signed in as ${stored.email}`));
+      const stored = await loginAndPersist(apiBaseUrl, email, pw);
+      console.log(chalk.green(`✔ signed in as ${stored.email} [profile: ${name}]`));
     } catch (err) {
       console.error(chalk.red(`✘ ${(err as Error).message}`));
       process.exit(1);
@@ -46,31 +74,136 @@ program
 
 program
   .command("logout")
-  .description("Clear stored credentials")
+  .description("Clear stored credentials for the active profile")
   .action(() => {
+    const { name } = loadActiveProfile();
     logoutAndClear();
-    console.log(chalk.green("✔ signed out"));
+    console.log(chalk.green(`✔ signed out [profile: ${name}]`));
   });
 
 program
   .command("whoami")
-  .description("Show the currently signed-in user")
+  .description("Show the currently signed-in user and active profile")
   .action(async () => {
-    const stored = load();
-    if (!stored) {
-      console.log(chalk.yellow("not signed in — run `drift login`"));
+    const { name, profile } = loadActiveProfile();
+    const hasCreds = Boolean(profile.accessToken || profile.pat);
+    if (!hasCreds) {
+      console.log(chalk.yellow(`not signed in [profile: ${name}] — run \`drift login\``));
+      console.log(chalk.gray(`api: ${profile.apiBaseUrl}`));
       process.exit(1);
     }
     try {
       const me = await api<{ email: string; id: string }>("/auth/me");
       console.log(`${chalk.green("●")} ${me.email}  (${me.id})`);
-      console.log(chalk.gray(`api: ${stored.apiBaseUrl}`));
+      console.log(chalk.gray(`profile: ${name}`));
+      console.log(chalk.gray(`api: ${profile.apiBaseUrl}`));
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
-        console.error(chalk.yellow("session expired — run `drift login`"));
+        console.error(chalk.yellow(`session expired [profile: ${name}] — run \`drift login\``));
       } else {
         console.error(chalk.red(`✘ ${(err as Error).message}`));
       }
+      process.exit(1);
+    }
+  });
+
+// ---------- profiles ----------
+
+const profile = program.command("profile").description("Manage API host + user profiles");
+
+profile
+  .command("list")
+  .description("List all profiles and show the active one")
+  .action(() => {
+    const { active, effectiveActive, profiles } = listProfiles();
+    const names = Object.keys(profiles);
+    if (names.length === 0) {
+      console.log(chalk.gray("no profiles"));
+      return;
+    }
+    for (const n of names) {
+      const p = profiles[n]!;
+      const marker = n === effectiveActive ? chalk.green("● ") : "  ";
+      const signed = p.pat ? "token" : p.accessToken ? "jwt" : chalk.gray("signed-out");
+      const email = p.email ?? chalk.gray("—");
+      console.log(`${marker}${chalk.bold(n.padEnd(12))}  ${chalk.dim(p.apiBaseUrl.padEnd(40))}  ${email}  ${signed}`);
+    }
+    if (effectiveActive !== active) {
+      console.log(chalk.yellow(`\n(AIDRIFT_PROFILE=${effectiveActive} overrides stored active "${active}")`));
+    }
+  });
+
+profile
+  .command("add")
+  .description("Add a new profile")
+  .requiredOption("--name <name>", "Profile name (letters, digits, _, -)")
+  .option("--url <url>", "API base URL", DEFAULT_API_URL)
+  .action((opts: { name: string; url: string }) => {
+    try {
+      addProfile(opts.name, opts.url);
+      console.log(chalk.green(`✔ added profile "${opts.name}" (${opts.url})`));
+      console.log(chalk.gray(`  → switch with \`drift profile use ${opts.name}\` then run \`drift login\``));
+    } catch (err) {
+      console.error(chalk.red(`✘ ${(err as Error).message}`));
+      process.exit(1);
+    }
+  });
+
+profile
+  .command("use")
+  .description("Switch the active profile")
+  .argument("<name>")
+  .action((name: string) => {
+    try {
+      useProfile(name);
+      const { profile: p } = loadActiveProfile();
+      console.log(chalk.green(`✔ active profile: ${name} (${p.apiBaseUrl})`));
+      if (!p.accessToken && !p.pat) {
+        console.log(chalk.yellow("  → not signed in; run `drift login`"));
+      } else if (p.email) {
+        console.log(chalk.gray(`  signed in as ${p.email}`));
+      }
+    } catch (err) {
+      console.error(chalk.red(`✘ ${(err as Error).message}`));
+      process.exit(1);
+    }
+  });
+
+profile
+  .command("remove")
+  .description("Delete a profile (credentials included)")
+  .argument("<name>")
+  .action((name: string) => {
+    try {
+      removeProfile(name);
+      console.log(chalk.green(`✔ removed profile "${name}"`));
+    } catch (err) {
+      console.error(chalk.red(`✘ ${(err as Error).message}`));
+      process.exit(1);
+    }
+  });
+
+profile
+  .command("current")
+  .description("Print the active profile name")
+  .action(() => {
+    const { name, profile: p } = loadActiveProfile();
+    console.log(name);
+    console.log(chalk.gray(`  api: ${p.apiBaseUrl}`));
+    if (p.email) console.log(chalk.gray(`  email: ${p.email}`));
+  });
+
+profile
+  .command("set-url")
+  .description("Update the API base URL of a profile")
+  .argument("<name>")
+  .argument("<url>")
+  .action((name: string, url: string) => {
+    try {
+      updateProfile(name, { apiBaseUrl: url });
+      console.log(chalk.green(`✔ profile "${name}" → ${url}`));
+    } catch (err) {
+      console.error(chalk.red(`✘ ${(err as Error).message}`));
       process.exit(1);
     }
   });
@@ -103,8 +236,9 @@ type ExecutionStage = "lint" | "build" | "test" | "runtime";
 type ExecutionStatus = "pass" | "fail";
 
 function requireAuth(): void {
-  if (!load()) {
-    console.error(chalk.yellow("not signed in — run `drift login`"));
+  const { name, profile: p } = loadActiveProfile();
+  if (!p.accessToken && !p.pat) {
+    console.error(chalk.yellow(`not signed in [profile: ${name}] — run \`drift login\``));
     process.exit(1);
   }
 }
