@@ -876,8 +876,8 @@ checkpoint
       const sid = await pickSessionId(opts.session);
       let turnId = opts.turn;
       if (!turnId) {
-        const turns = await api<TurnDto[]>(`/sessions/${sid}/turns`);
-        const last = turns.at(-1);
+        const turns = await api<TurnDto[]>(`/sessions/${sid}/turns?limit=1`);
+        const last = turns[0];
         if (!last) throw new Error("no turns yet; add one before creating a checkpoint");
         turnId = last.id;
       }
