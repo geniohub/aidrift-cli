@@ -5,7 +5,10 @@ import { input, password as passwordPrompt } from "@inquirer/prompts";
 import { readFile } from "node:fs/promises";
 import { spawn, spawnSync } from "node:child_process";
 import { basename, resolve } from "node:path";
-import { VERSION } from "@aidrift/core";
+import { createRequire } from "node:module";
+
+const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
+const VERSION = pkg.version;
 import { api, ApiError, DEFAULT_API_URL, loginAndPersist, loginWithTokenAndPersist, logoutAndClear } from "./api-client.js";
 import {
   addProfile,
