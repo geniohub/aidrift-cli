@@ -27,7 +27,7 @@ Run `drift --help` for the full command list.
 
 - **[aidrift-plugin](https://github.com/geniohub/aidrift-plugin)** — Claude Code plugin that uses this CLI for auto-tracking + MCP tools.
 - **[aidrift-vscode](https://github.com/geniohub/aidrift-vscode)** — VSCode extension with a live status bar and session sidebar.
-- **[aidrift-marketplace](https://github.com/geniohub/aidrift-marketplace)** — the Claude Code plugin marketplace.
+- **[aidrift-plugins](https://github.com/geniohub/aidrift-plugins)** — the Claude Code plugin marketplace (named `geniohub`).
 
 ## Configuration
 
