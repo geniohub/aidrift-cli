@@ -820,6 +820,21 @@ interface CheckpointDto {
   createdAt: string;
 }
 
+interface GitEventDto {
+  id: string;
+  sessionId: string;
+  turnId: string | null;
+  type: "commit" | "push" | "branch_create" | "branch_switch";
+  commitHash: string | null;
+  commitShort: string | null;
+  commitMessage: string | null;
+  branch: string;
+  remote: string | null;
+  author: string | null;
+  aiInitiated: boolean;
+  createdAt: string;
+}
+
 async function pickSessionId(opt?: string): Promise<string> {
   if (opt) return opt;
   const list = await api<SessionDto[]>("/sessions");
@@ -912,6 +927,90 @@ checkpoint
         const stable = c.scoreAtCheckpoint >= 75 ? chalk.green("stable  ") : chalk.yellow("unstable");
         console.log(`${stable} ${chalk.bold(c.id.slice(-8))}  score ${colorScore(c.scoreAtCheckpoint)}  ${chalk.dim(c.summary)}`);
       }
+    } catch (err) {
+      console.error(chalk.red(`✘ ${(err as Error).message}`));
+      process.exit(1);
+    }
+  });
+
+const gitEvent = program.command("git-event").description("Record git commit/push/branch events against a session");
+gitEvent
+  .command("record")
+  .description("Record a git event (commit/push/branch_create/branch_switch) for a session")
+  .option("--session <id>", "Session id (defaults to active open session)")
+  .option("--turn <id>", "Anchor turn id (optional)")
+  .requiredOption("--type <type>", "commit|push|branch_create|branch_switch")
+  .option("--sha <sha>", "Commit SHA (auto-detected for commit type when omitted)")
+  .option("--subject <text>", "Commit subject line (auto-read via `git log -1` when SHA is known)")
+  .option("--branch <name>", "Branch name (auto-detected when omitted)")
+  .option("--remote <name>", "Remote name, e.g. origin (push events)")
+  .option("--author <email>", "Commit author (auto-read for commit type)")
+  .option("--files-changed <n>", "Files changed in the commit", (v) => parseInt(v, 10))
+  .option("--insertions <n>", "Insertion count", (v) => parseInt(v, 10))
+  .option("--deletions <n>", "Deletion count", (v) => parseInt(v, 10))
+  .option("--ai", "Mark as AI-initiated (plugin/agent triggered this event)")
+  .option("--json", "Print the recorded event as JSON")
+  .action(async (opts: {
+    session?: string;
+    turn?: string;
+    type: string;
+    sha?: string;
+    subject?: string;
+    branch?: string;
+    remote?: string;
+    author?: string;
+    filesChanged?: number;
+    insertions?: number;
+    deletions?: number;
+    ai?: boolean;
+    json?: boolean;
+  }) => {
+    requireAuth();
+    try {
+      const type = opts.type;
+      if (!["commit", "push", "branch_create", "branch_switch"].includes(type)) {
+        throw new Error(`--type must be commit|push|branch_create|branch_switch, got: ${type}`);
+      }
+      let sha = opts.sha;
+      if (!sha && type === "commit") sha = runGit(["rev-parse", "HEAD"]);
+      let subject = opts.subject;
+      if (!subject && sha && type === "commit") {
+        subject = runGit(["log", "-1", "--format=%s", sha]);
+      }
+      let author = opts.author;
+      if (!author && sha && type === "commit") {
+        author = runGit(["log", "-1", "--format=%ae", sha]);
+      }
+      const branch = opts.branch ?? currentBranch() ?? "HEAD";
+      const sid = await pickSessionId(opts.session);
+      const body: Record<string, unknown> = {
+        type,
+        branch,
+        aiInitiated: opts.ai ?? false,
+      };
+      if (sha) {
+        body.commitHash = sha;
+        body.commitShort = sha.slice(0, 7);
+      }
+      if (subject) body.commitMessage = subject;
+      if (opts.remote) body.remote = opts.remote;
+      if (author) body.author = author;
+      if (opts.turn) body.turnId = opts.turn;
+      if (typeof opts.filesChanged === "number") body.filesChanged = opts.filesChanged;
+      if (typeof opts.insertions === "number") body.insertions = opts.insertions;
+      if (typeof opts.deletions === "number") body.deletions = opts.deletions;
+
+      const e = await api<GitEventDto>(`/sessions/${sid}/git-events`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      if (opts.json) {
+        console.log(JSON.stringify(e));
+        return;
+      }
+      const shortSha = e.commitShort ?? (e.commitHash ? e.commitHash.slice(0, 7) : "—");
+      const ai = e.aiInitiated ? chalk.cyan("[ai]") : chalk.gray("[human]");
+      console.log(chalk.green(`✔ git-event ${e.type} ${shortSha} on ${e.branch} ${ai}`));
     } catch (err) {
       console.error(chalk.red(`✘ ${(err as Error).message}`));
       process.exit(1);
