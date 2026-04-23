@@ -1,6 +1,6 @@
 {
   "name": "@aidrift/cli",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "drift CLI — watch your AI coding sessions, detect drift, checkpoint safely.",
   "type": "module",
   "bin": {

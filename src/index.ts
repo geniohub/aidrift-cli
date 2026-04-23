@@ -438,16 +438,42 @@ turn
   .requiredOption("--prompt <text>")
   .requiredOption("--response <text>")
   .option("--meta <json>")
-  .action(async (opts: { session: string; prompt: string; response: string; meta?: string }) => {
+  .option("--git-sha <sha>", "HEAD sha at turn-start time (for provenance)")
+  .option("--git-branch <name>", "Branch at turn-start time")
+  .option("--git-root <path>", "Absolute git root path")
+  .option("--working-tree-clean", "Record working tree as clean at turn start")
+  .option("--working-tree-dirty", "Record working tree as dirty at turn start")
+  .action(async (opts: {
+    session: string;
+    prompt: string;
+    response: string;
+    meta?: string;
+    gitSha?: string;
+    gitBranch?: string;
+    gitRoot?: string;
+    workingTreeClean?: boolean;
+    workingTreeDirty?: boolean;
+  }) => {
     requireAuth();
-    const metadata = opts.meta ? JSON.parse(opts.meta) as Record<string, unknown> : undefined;
+    const metadata: Record<string, unknown> = opts.meta
+      ? (JSON.parse(opts.meta) as Record<string, unknown>)
+      : {};
+    const git: Record<string, unknown> = {};
+    if (opts.gitSha) git.sha = opts.gitSha;
+    if (opts.gitBranch) git.branch = opts.gitBranch;
+    if (opts.gitRoot) git.root = opts.gitRoot;
+    if (opts.workingTreeClean) git.clean = true;
+    else if (opts.workingTreeDirty) git.clean = false;
+    if (Object.keys(git).length > 0) {
+      metadata.git = { ...(metadata.git as Record<string, unknown> | undefined), ...git };
+    }
     try {
       const t = await api<TurnDto>(`/sessions/${opts.session}/turns`, {
         method: "POST",
         body: JSON.stringify({
           userPrompt: opts.prompt,
           modelResponse: opts.response,
-          metadata,
+          metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
         }),
       });
       console.log(chalk.green(`✔ turn ${t.turnIndex} (${t.id.slice(-8)})`));
