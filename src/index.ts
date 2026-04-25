@@ -873,11 +873,16 @@ program
   .command("status")
   .description("Show current drift status for a session (defaults to most recent)")
   .option("--session <id>")
-  .action(async (opts: { session?: string }) => {
+  .option("--json", "Print the raw StatusDto as JSON (consumed by the Claude Code plugin's commit-gate hook)")
+  .action(async (opts: { session?: string; json?: boolean }) => {
     requireAuth();
     try {
       const sid = await pickSessionId(opts.session);
       const s = await api<StatusDto>(`/sessions/${sid}/status`);
+      if (opts.json) {
+        console.log(JSON.stringify(s));
+        return;
+      }
       const scoreStr = s.currentScore !== null ? colorScore(s.currentScore) : chalk.gray("  —");
       console.log(chalk.bold(s.session.taskDescription));
       console.log(`  provider: ${s.session.provider}   turns: ${s.turnCount}`);
