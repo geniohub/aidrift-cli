@@ -1043,6 +1043,65 @@ gitEvent
     }
   });
 
+const secretFinding = program
+  .command("secret-finding")
+  .description("Forward client-side secret-scan findings to the AiDrift server (Git Provenance Phase 3b)");
+secretFinding
+  .command("record")
+  .description("Batch-record secret findings from a JSONL file (one finding per line, schema {pattern, preview, location})")
+  .requiredOption("--session <id>", "Session id the findings belong to")
+  .option("--turn <id>", "Turn id the findings were observed in (optional)")
+  .option("--commit <id>", "GitEvent id the findings were observed in (optional)")
+  .option("--jsonl <path>", "Path to a JSONL file produced by the plugin scanner")
+  .option("--quiet", "Suppress success line (useful for hook callers)")
+  .action(async (opts: {
+    session: string;
+    turn?: string;
+    commit?: string;
+    jsonl?: string;
+    quiet?: boolean;
+  }) => {
+    requireAuth();
+    try {
+      let findings: Array<{ pattern: string; preview: string; location: string }> = [];
+      if (opts.jsonl) {
+        const raw = await readFile(opts.jsonl, "utf8");
+        for (const line of raw.split(/\r?\n/)) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const obj = JSON.parse(trimmed) as { pattern?: string; preview?: string; location?: string };
+            if (typeof obj.pattern !== "string" || typeof obj.preview !== "string") continue;
+            findings.push({
+              pattern: obj.pattern.slice(0, 64),
+              preview: obj.preview.slice(0, 64),
+              location: typeof obj.location === "string" ? obj.location : "unknown",
+            });
+          } catch {
+            // skip malformed lines silently
+          }
+        }
+      }
+      if (findings.length === 0) {
+        if (!opts.quiet) console.log(chalk.gray("no findings to record"));
+        return;
+      }
+      const body: Record<string, unknown> = { findings };
+      if (opts.turn) body.turnId = opts.turn;
+      if (opts.commit) body.commitId = opts.commit;
+      const result = await api<{ inserted: number }>(`/sessions/${opts.session}/secret-findings`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      if (!opts.quiet) {
+        console.log(chalk.green(`✔ recorded ${result.inserted} secret finding(s)`));
+      }
+    } catch (err) {
+      console.error(chalk.red(`✘ ${(err as Error).message}`));
+      process.exit(1);
+    }
+  });
+
 program.command("watch").description("[Phase 6] Watch Claude Code transcripts").action(() => console.log("[Phase 6 stub]"));
 program.command("report").option("--json").action(() => console.log("[Phase 8 stub] report"));
 
